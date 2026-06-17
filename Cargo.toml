@@ -1,0 +1,36 @@
+[package]
+name = "horizon-core"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Reusable building blocks for The Graph Horizon data services: TAP v2 (GraphTally) receipt validation, RAV aggregation, on-chain collection, persistence, and a generic TAP-gated reverse proxy."
+repository = "https://github.com/lodestar-team/horizon-core"
+
+[dependencies]
+# Web
+axum = { version = "0.8", features = ["macros"] }
+tower-http = { version = "0.6", features = ["trace"] }
+tower_governor = { version = "0.8", features = ["axum"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# Database
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "tls-rustls", "migrate"] }
+
+# EVM / crypto
+alloy = { version = "0.5", features = ["full"] }
+alloy-primitives = "0.8"
+alloy-sol-types = "0.8"
+k256 = { version = "0.13", features = ["ecdsa"] }
+hex = "0.4"
+
+# Config / serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Runtime / utils
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dotenvy = "0.15"
