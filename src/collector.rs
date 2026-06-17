@@ -202,3 +202,61 @@ fn encode_collect_data(
     let encoded = (signed_rav, U256::ZERO).abi_encode_sequence();
     Ok(Bytes::from(encoded))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_sol_types::SolValue;
+
+    /// The collect() calldata must decode back to the exact (SignedRAV, tokensToCollect)
+    /// tuple the on-chain contract expects via abi.decode(data, (SignedRAV, uint256)).
+    #[test]
+    fn encode_collect_data_round_trips() {
+        let collection_id = format!("0x{}", hex::encode([0x11u8; 32]));
+        let payer = "0x00000000000000000000000000000000000000aa";
+        let service_provider = "0x00000000000000000000000000000000000000bb";
+        let data_service = "0x00000000000000000000000000000000000000cc";
+        let timestamp_ns = 1_700_000_000_000_000_000u64;
+        let value_aggregate = 123_456_789_000_000_000u128;
+        let signature = format!("0x{}", hex::encode([0x22u8; 65]));
+
+        let encoded = encode_collect_data(
+            &collection_id,
+            payer,
+            service_provider,
+            data_service,
+            timestamp_ns,
+            value_aggregate,
+            &signature,
+        )
+        .expect("encode");
+
+        // Decode as the Solidity contract would: abi.decode(data, (SignedRAV, uint256)).
+        let (decoded, tokens): (SignedRavData, U256) =
+            <(SignedRavData, U256)>::abi_decode_sequence(&encoded, true).expect("decode");
+
+        assert_eq!(tokens, U256::ZERO, "tokensToCollect must be 0 (collect full)");
+        assert_eq!(decoded.rav.collectionId, FixedBytes::from([0x11u8; 32]));
+        assert_eq!(decoded.rav.payer, payer.parse::<Address>().unwrap());
+        assert_eq!(decoded.rav.serviceProvider, service_provider.parse::<Address>().unwrap());
+        assert_eq!(decoded.rav.dataService, data_service.parse::<Address>().unwrap());
+        assert_eq!(decoded.rav.timestampNs, timestamp_ns);
+        assert_eq!(decoded.rav.valueAggregate, value_aggregate);
+        assert_eq!(decoded.signature.len(), 65);
+        assert_eq!(decoded.signature.as_ref(), &[0x22u8; 65]);
+    }
+
+    #[test]
+    fn encode_collect_data_rejects_bad_collection_id() {
+        let err = encode_collect_data(
+            "0xdeadbeef", // not 32 bytes
+            "0x00000000000000000000000000000000000000aa",
+            "0x00000000000000000000000000000000000000bb",
+            "0x00000000000000000000000000000000000000cc",
+            1,
+            1,
+            "0x00",
+        );
+        assert!(err.is_err());
+    }
+}
