@@ -35,15 +35,19 @@ use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
 
 pub mod addresses;
 pub mod aggregator;
+pub mod backend;
 pub mod collector;
 pub mod config;
 pub mod db;
+pub mod gate;
 pub mod pricing;
 pub mod proxy;
 pub mod tap;
 
+pub use backend::{BackendResolver, SharedBackend};
 pub use config::Config;
 pub use db::Pool;
+pub use gate::{RequestGate, SharedGate};
 pub use pricing::{PricingPolicy, SharedPricing};
 
 /// Shared state injected into every Axum handler.
@@ -55,6 +59,31 @@ pub struct AppState {
     pub domain_sep: B256,
     /// Per-request pricing policy. Defaults to [`pricing::FlatPricing`] (no minimum).
     pub pricing: SharedPricing,
+    /// Pre-forward request gate. Defaults to [`gate::AllowAll`].
+    pub gate: SharedGate,
+    /// Upstream backend resolver. Defaults to [`backend::SingleBackend`] over
+    /// `config.backend.upstream_url`.
+    pub backend: SharedBackend,
+}
+
+impl AppState {
+    /// Replace the pre-forward [`RequestGate`] (builder style).
+    pub fn with_gate(mut self, gate: SharedGate) -> Self {
+        self.gate = gate;
+        self
+    }
+
+    /// Replace the [`BackendResolver`] (builder style) — e.g. for multi-backend routing.
+    pub fn with_backend(mut self, backend: SharedBackend) -> Self {
+        self.backend = backend;
+        self
+    }
+
+    /// Replace the [`PricingPolicy`] (builder style).
+    pub fn with_pricing(mut self, pricing: SharedPricing) -> Self {
+        self.pricing = pricing;
+        self
+    }
 }
 
 /// Build [`AppState`] with the default ([`pricing::FlatPricing`]) policy.
@@ -88,7 +117,18 @@ pub async fn build_state_with(
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
 
-    Ok(AppState { config, pool, http_client, domain_sep, pricing })
+    let backend: SharedBackend =
+        Arc::new(backend::SingleBackend(config.backend.upstream_url.clone()));
+
+    Ok(AppState {
+        config,
+        pool,
+        http_client,
+        domain_sep,
+        pricing,
+        gate: gate::allow_all(),
+        backend,
+    })
 }
 
 /// Spawn the RAV aggregator and on-chain collector background tasks.
@@ -161,15 +201,27 @@ async fn run_inner(
     pricing: SharedPricing,
     extra: Router<AppState>,
 ) -> anyhow::Result<()> {
-    let config = Arc::new(config);
-    let state = build_state_with(Arc::clone(&config), pricing).await?;
+    let state = build_state_with(Arc::new(config), pricing).await?;
+    run_state(state, extra).await
+}
+
+/// Spawn background tasks and serve a pre-built [`AppState`] alongside `extra`
+/// routes. Use this when you've customised the state via the `with_*` builders
+/// (e.g. a [`RequestGate`] or multi-backend [`BackendResolver`]):
+///
+/// ```no_run
+/// # async fn f(config: horizon_core::Config, gate: horizon_core::SharedGate) -> anyhow::Result<()> {
+/// let state = horizon_core::build_state(std::sync::Arc::new(config)).await?.with_gate(gate);
+/// horizon_core::run_state(state, axum::Router::new()).await
+/// # }
+/// ```
+pub async fn run_state(state: AppState, extra: Router<AppState>) -> anyhow::Result<()> {
     spawn_background(&state);
 
-    let addr = format!("{}:{}", config.server.host, config.server.port);
+    let addr = format!("{}:{}", state.config.server.host, state.config.server.port);
+    tracing::info!(%addr, "horizon-core gateway listening");
+
     let app = router_with(state, extra);
-
-    tracing::info!(%addr, upstream = %config.backend.upstream_url, "horizon-core gateway listening");
-
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())

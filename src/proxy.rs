@@ -59,6 +59,13 @@ pub async fn gate_request(
         ));
     }
 
+    // Run the pre-forward gate (credit/escrow/allowlist checks; AllowAll by default).
+    state
+        .gate
+        .check(&validated, path)
+        .await
+        .map_err(|r| (r.status, r.message))?;
+
     match db::insert_receipt(&state.pool, &validated).await {
         Ok(()) => Ok(validated),
         Err(e) if is_duplicate_nonce(&e) => {
@@ -84,18 +91,19 @@ pub async fn handler(
     // ── 2-3. Validate + price + persist (reject replays) ──────────────────────
     let _validated = gate_request(&state, &header_str, req.uri().path()).await?;
 
-    // ── 4. Proxy to the upstream data plane ───────────────────────────────────
+    // ── 4. Resolve the upstream backend and proxy to it ───────────────────────
+    let upstream = state
+        .backend
+        .resolve(req.uri().path())
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "no backend configured for this path".to_string()))?;
+
     let path_and_query = req
         .uri()
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or("/");
 
-    let backend_url = format!(
-        "{}{}",
-        state.config.backend.upstream_url.trim_end_matches('/'),
-        path_and_query
-    );
+    let backend_url = format!("{}{}", upstream.trim_end_matches('/'), path_and_query);
 
     let method = reqwest::Method::from_bytes(req.method().as_str().as_bytes())
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
