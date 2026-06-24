@@ -18,28 +18,26 @@ use crate::{db, tap, AppState};
 /// Maximum request body the gateway will buffer before forwarding (4 MiB).
 const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 
-pub async fn handler(
-    State(state): State<AppState>,
-    req: Request<Body>,
-) -> Result<Response<Body>, (StatusCode, String)> {
-    // ── 1. Extract TAP-Receipt header ─────────────────────────────────────────
-    let tap_header = req
-        .headers()
-        .get("tap-receipt")
-        .ok_or_else(|| (StatusCode::PAYMENT_REQUIRED, "TAP-Receipt header required".into()))?;
-
-    let header_str = tap_header
-        .to_str()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "TAP-Receipt is not valid UTF-8".into()))?;
-
-    // ── 2. Validate receipt ───────────────────────────────────────────────────
+/// Validate a `TAP-Receipt` value for `path`, enforce the gateway's
+/// [`PricingPolicy`](crate::pricing::PricingPolicy), and persist the receipt
+/// (rejecting replayed nonces). Returns the validated receipt, or an HTTP
+/// `(status, message)` to return to the client.
+///
+/// This is the receipt-gating pipeline the proxy uses, exposed for custom routes
+/// (e.g. a WebSocket handler) that need the same gating. `path` is used only for
+/// the pricing lookup — pass the request path without its query string.
+pub async fn gate_request(
+    state: &AppState,
+    tap_header: &str,
+    path: &str,
+) -> Result<tap::ValidatedReceipt, (StatusCode, String)> {
     let now_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos() as u64;
 
     let validated = tap::validate_receipt(
-        header_str,
+        tap_header,
         state.domain_sep,
         &state.config.tap.authorized_senders,
         state.config.tap.data_service_address,
@@ -49,14 +47,42 @@ pub async fn handler(
     )
     .map_err(|e| (StatusCode::PAYMENT_REQUIRED, e.to_string()))?;
 
-    // ── 3. Persist receipt (reject replayed nonces) ───────────────────────────
-    match db::insert_receipt(&state.pool, &validated).await {
-        Ok(()) => {}
-        Err(e) if is_duplicate_nonce(&e) => {
-            return Err((StatusCode::PAYMENT_REQUIRED, "receipt nonce already used".into()));
-        }
-        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    // Enforce per-endpoint pricing: the receipt value must cover this path's price.
+    let min_value = state.pricing.min_value(path);
+    if validated.receipt.value < min_value {
+        return Err((
+            StatusCode::PAYMENT_REQUIRED,
+            format!(
+                "receipt value {} below required {min_value} for {path}",
+                validated.receipt.value
+            ),
+        ));
     }
+
+    match db::insert_receipt(&state.pool, &validated).await {
+        Ok(()) => Ok(validated),
+        Err(e) if is_duplicate_nonce(&e) => {
+            Err((StatusCode::PAYMENT_REQUIRED, "receipt nonce already used".into()))
+        }
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
+}
+
+pub async fn handler(
+    State(state): State<AppState>,
+    req: Request<Body>,
+) -> Result<Response<Body>, (StatusCode, String)> {
+    // ── 1. Extract TAP-Receipt header ─────────────────────────────────────────
+    let header_str = req
+        .headers()
+        .get("tap-receipt")
+        .ok_or_else(|| (StatusCode::PAYMENT_REQUIRED, "TAP-Receipt header required".to_string()))?
+        .to_str()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "TAP-Receipt is not valid UTF-8".to_string()))?
+        .to_owned();
+
+    // ── 2-3. Validate + price + persist (reject replays) ──────────────────────
+    let _validated = gate_request(&state, &header_str, req.uri().path()).await?;
 
     // ── 4. Proxy to the upstream data plane ───────────────────────────────────
     let path_and_query = req

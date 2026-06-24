@@ -20,7 +20,10 @@
 //! ```
 //!
 //! Services that need extra routes can instead use [`build_state`],
-//! [`standard_router`], and [`spawn_background`] directly.
+//! [`standard_router`], and [`spawn_background`] directly. For per-endpoint
+//! pricing or custom routes (e.g. WebSocket), see [`build_state_with`],
+//! [`router_with`], [`run_with`], [`proxy::gate_request`], and the [`pricing`]
+//! module.
 
 use std::sync::Arc;
 
@@ -35,11 +38,13 @@ pub mod aggregator;
 pub mod collector;
 pub mod config;
 pub mod db;
+pub mod pricing;
 pub mod proxy;
 pub mod tap;
 
 pub use config::Config;
 pub use db::Pool;
+pub use pricing::{PricingPolicy, SharedPricing};
 
 /// Shared state injected into every Axum handler.
 #[derive(Clone)]
@@ -48,11 +53,21 @@ pub struct AppState {
     pub pool: Pool,
     pub http_client: Client,
     pub domain_sep: B256,
+    /// Per-request pricing policy. Defaults to [`pricing::FlatPricing`] (no minimum).
+    pub pricing: SharedPricing,
 }
 
-/// Build [`AppState`]: connect + migrate the database and pre-compute the
-/// EIP-712 domain separator from config.
+/// Build [`AppState`] with the default ([`pricing::FlatPricing`]) policy.
 pub async fn build_state(config: Arc<Config>) -> anyhow::Result<AppState> {
+    build_state_with(config, pricing::flat()).await
+}
+
+/// Build [`AppState`] with a custom [`PricingPolicy`]: connect + migrate the
+/// database and pre-compute the EIP-712 domain separator from config.
+pub async fn build_state_with(
+    config: Arc<Config>,
+    pricing: SharedPricing,
+) -> anyhow::Result<AppState> {
     let pool = db::connect(&config.database.url).await?;
     tracing::info!(url = %config.database.url, "database connected");
 
@@ -73,7 +88,7 @@ pub async fn build_state(config: Arc<Config>) -> anyhow::Result<AppState> {
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
 
-    Ok(AppState { config, pool, http_client, domain_sep })
+    Ok(AppState { config, pool, http_client, domain_sep, pricing })
 }
 
 /// Spawn the RAV aggregator and on-chain collector background tasks.
@@ -85,6 +100,18 @@ pub fn spawn_background(state: &AppState) {
 /// Build the standard router: unauthenticated `/health` + `/ready`, and a
 /// rate-limited, TAP-gated catch-all proxy to the configured upstream.
 pub fn standard_router(state: AppState) -> Router {
+    router_with(state, Router::new())
+}
+
+/// Like [`standard_router`], but merges caller-provided `extra` routes (e.g. a
+/// WebSocket relay) alongside the proxy. The `extra` routes share [`AppState`]
+/// and the same per-IP rate limiter, and — being more specific — take precedence
+/// over the catch-all proxy. `/health` and `/ready` remain unauthenticated and
+/// unthrottled.
+///
+/// Custom routes can gate themselves with [`proxy::gate_request`] to reuse the
+/// receipt validation + pricing + persistence pipeline.
+pub fn router_with(state: AppState, extra: Router<AppState>) -> Router {
     let cfg = Arc::clone(&state.config);
 
     let period_ms = 1_000u64 / cfg.rate_limit.requests_per_second.max(1) as u64;
@@ -99,7 +126,8 @@ pub fn standard_router(state: AppState) -> Router {
         "rate limiter configured"
     );
 
-    let proxy_routes = Router::new()
+    // Custom routes first (more specific), then the catch-all proxy; all rate-limited.
+    let gated = extra
         .route("/{*path}", any(proxy::handler))
         .route("/", any(proxy::handler))
         .layer(GovernorLayer::new(governor_conf));
@@ -107,19 +135,38 @@ pub fn standard_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
-        .merge(proxy_routes)
+        .merge(gated)
         .with_state(state)
 }
 
 /// Run a complete standard gateway: build state, spawn background tasks, and
 /// serve the standard router. The common one-liner for a new data service.
 pub async fn run(config: Config) -> anyhow::Result<()> {
+    run_inner(config, pricing::flat(), Router::new()).await
+}
+
+/// Like [`run`], but with a custom [`PricingPolicy`] and `extra` routes — the
+/// entry point for services that need per-endpoint pricing and/or custom routes
+/// (e.g. a WebSocket data service) while reusing all the payment plumbing.
+pub async fn run_with(
+    config: Config,
+    pricing: SharedPricing,
+    extra: Router<AppState>,
+) -> anyhow::Result<()> {
+    run_inner(config, pricing, extra).await
+}
+
+async fn run_inner(
+    config: Config,
+    pricing: SharedPricing,
+    extra: Router<AppState>,
+) -> anyhow::Result<()> {
     let config = Arc::new(config);
-    let state = build_state(Arc::clone(&config)).await?;
+    let state = build_state_with(Arc::clone(&config), pricing).await?;
     spawn_background(&state);
 
     let addr = format!("{}:{}", config.server.host, config.server.port);
-    let app = standard_router(state);
+    let app = router_with(state, extra);
 
     tracing::info!(%addr, upstream = %config.backend.upstream_url, "horizon-core gateway listening");
 
